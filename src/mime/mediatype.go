@@ -303,6 +303,11 @@ func consumeValue(v string) (value, rest string) {
 	}
 
 	// parse a quoted-string
+	// Without escapes, the value is a substring of v.
+	if i := strings.IndexAny(v[1:], "\"\\\r\n"); i >= 0 && v[1+i] == '"' {
+		return v[1 : 1+i], v[2+i:]
+	}
+
 	buffer := new(strings.Builder)
 	for i := 1; i < len(v); i++ {
 		r := v[i]
