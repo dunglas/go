@@ -627,6 +627,79 @@ var nl = []byte("\n")
 
 // upcomingHeaderKeys returns an approximation of the number of keys
 // that will be in this header. If it gets confused, it returns 0.
+// readMIMEHeaderInto is readMIMEHeader filling m, which must be empty.
+// The values of new keys are slices of strs, if it's long enough.
+// It is called by the mime/multipart package.
+//
+//go:linkname readMIMEHeaderInto
+func readMIMEHeaderInto(r *Reader, m MIMEHeader, strs []string, maxMemory, maxHeaders int64) error {
+	if maxMemory < 0 {
+		return errMessageTooLarge
+	}
+
+	// The first line cannot start with a leading space.
+	if buf, err := r.R.Peek(1); err == nil && (buf[0] == ' ' || buf[0] == '\t') {
+		const errorLimit = 80 // arbitrary limit on how much of the line we'll quote
+		line, err := r.readLineSlice(errorLimit)
+		if err != nil {
+			return err
+		}
+		return ProtocolError(fmt.Sprintf("malformed MIME header initial line: %q", line))
+	}
+
+	for {
+		kv, err := r.readContinuedLineSlice(maxMemory, mustHaveFieldNameColon)
+		if len(kv) == 0 {
+			return err
+		}
+
+		// Key ends at first colon.
+		k, v, ok := bytes.Cut(kv, colon)
+		if !ok {
+			return ProtocolError(fmt.Sprintf("malformed MIME header line: %q", kv))
+		}
+		key, ok := canonicalMIMEHeaderKey(k)
+		if !ok {
+			return ProtocolError(fmt.Sprintf("malformed MIME header line: %q", kv))
+		}
+		for _, c := range v {
+			if !validHeaderValueByte(c) {
+				return ProtocolError(fmt.Sprintf("malformed MIME header line: %q", kv))
+			}
+		}
+
+		maxHeaders--
+		if maxHeaders < 0 {
+			return errMessageTooLarge
+		}
+
+		// Skip initial spaces in value.
+		value := string(bytes.TrimLeft(v, " \t"))
+
+		vv := m[key]
+		if vv == nil {
+			const mapEntryOverhead = 200
+			maxMemory -= int64(len(key))
+			maxMemory -= mapEntryOverhead
+		}
+		maxMemory -= int64(len(value))
+		if maxMemory < 0 {
+			return errMessageTooLarge
+		}
+		if vv == nil && len(strs) > 0 {
+			vv, strs = strs[:1:1], strs[1:]
+			vv[0] = value
+			m[key] = vv
+		} else {
+			m[key] = append(vv, value)
+		}
+
+		if err != nil {
+			return err
+		}
+	}
+}
+
 func (r *Reader) upcomingHeaderKeys() (n int) {
 	// Try to determine the 'hint' size.
 	r.R.Peek(1) // force a buffer load if empty

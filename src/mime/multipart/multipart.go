@@ -117,14 +117,29 @@ func (p *Part) parseContentDisposition() {
 // the message's "Content-Type" header. Use [mime.ParseMediaType] to
 // parse such headers.
 func NewReader(r io.Reader, boundary string) *Reader {
-	b := []byte("\r\n--" + boundary + "--")
-	return &Reader{
-		bufReader:        bufio.NewReaderSize(&stickyErrorReader{r: r}, peekBufferSize),
-		nl:               b[:2],
-		nlDashBoundary:   b[:len(b)-2],
-		dashBoundaryDash: b[2:],
-		dashBoundary:     b[2 : len(b)-2],
+	mr := new(Reader)
+	mr.Reset(r, boundary)
+	return mr
+}
+
+// Reset discards the [Reader]'s state and makes it read the parts of r,
+// separated by boundary, like [NewReader]. It reuses the memory of the
+// [Reader]: parts returned before Reset must not be used anymore.
+func (r *Reader) Reset(src io.Reader, boundary string) {
+	r.src = stickyErrorReader{r: src}
+	if r.bufReader == nil {
+		r.bufReader = bufio.NewReaderSize(&r.src, peekBufferSize)
+	} else {
+		r.bufReader.Reset(&r.src)
 	}
+	b := append(append(append(r.boundary[:0], "\r\n--"...), boundary...), "--"...)
+	r.boundary = b
+	r.nl = b[:2]
+	r.nlDashBoundary = b[:len(b)-2]
+	r.dashBoundaryDash = b[2:]
+	r.dashBoundary = b[2 : len(b)-2]
+	r.currentPart = nil
+	r.partsRead = 0
 }
 
 // stickyErrorReader is an io.Reader which never calls Read on its
@@ -164,6 +179,42 @@ func newPart(mr *Reader, rawPart bool, maxMIMEHeaderSize, maxMIMEHeaders int64) 
 		}
 	}
 	return bp, nil
+}
+
+// reusePart reads the next part into r.part.
+func (r *Reader) reusePart(rawPart bool, maxMIMEHeaderSize, maxMIMEHeaders int64) (*Part, error) {
+	header := r.part.Header
+	if header == nil {
+		header = make(textproto.MIMEHeader)
+	}
+	clear(header)
+	if r.strs == nil {
+		r.strs = make([]string, 16)
+	}
+	clear(r.strs)
+
+	r.tr = textproto.Reader{R: r.bufReader}
+	err := readMIMEHeaderInto(&r.tr, header, r.strs, maxMIMEHeaderSize, maxMIMEHeaders)
+	r.tr = textproto.Reader{}
+	if err != nil {
+		// TODO: Add a distinguishable error to net/textproto.
+		if err.Error() == "message too large" {
+			err = ErrMessageTooLarge
+		}
+		return nil, err
+	}
+
+	p := &r.part
+	*p = Part{Header: header, mr: r}
+	p.r = partReader{p}
+	if !rawPart {
+		const cte = "Content-Transfer-Encoding"
+		if strings.EqualFold(p.Header.Get(cte), "quoted-printable") {
+			p.Header.Del(cte)
+			p.r = quotedprintable.NewReader(p.r)
+		}
+	}
+	return p, nil
 }
 
 func (p *Part) populateHeaders(maxMIMEHeaderSize, maxMIMEHeaders int64) error {
@@ -331,8 +382,19 @@ func (p *Part) Close() error {
 // Reader's underlying parser consumes its input as needed. Seeking
 // isn't supported.
 type Reader struct {
+	// ReuseParts controls whether calls to NextPart and NextRawPart may
+	// return the Part of the previous call, with its Header, for performance.
+	// By default, each call returns a newly allocated Part owned by the caller.
+	ReuseParts bool
+
 	bufReader *bufio.Reader
+	src       stickyErrorReader
+	boundary  []byte
 	tempDir   string // used in tests
+
+	part Part // reused when ReuseParts is set
+	tr   textproto.Reader
+	strs []string
 
 	currentPart *Part
 	partsRead   int
@@ -406,7 +468,13 @@ func (r *Reader) nextPart(rawPart bool, maxMIMEHeaderSize, maxMIMEHeaders int64)
 
 		if r.isBoundaryDelimiterLine(line) {
 			r.partsRead++
-			bp, err := newPart(r, rawPart, maxMIMEHeaderSize, maxMIMEHeaders)
+			var bp *Part
+			var err error
+			if r.ReuseParts {
+				bp, err = r.reusePart(rawPart, maxMIMEHeaderSize, maxMIMEHeaders)
+			} else {
+				bp, err = newPart(r, rawPart, maxMIMEHeaderSize, maxMIMEHeaders)
+			}
 			if err != nil {
 				return nil, err
 			}

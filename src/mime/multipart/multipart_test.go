@@ -12,6 +12,7 @@ import (
 	"net/textproto"
 	"os"
 	"reflect"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -1016,5 +1017,119 @@ func TestNoBoundary(t *testing.T) {
 	_, err := mr.NextPart()
 	if got, want := fmt.Sprint(err), "multipart: boundary is empty"; got != want {
 		t.Errorf("NextPart error = %v; want %v", got, want)
+	}
+}
+
+func TestReuseParts(t *testing.T) {
+	type part struct {
+		header textproto.MIMEHeader
+		name   string
+		body   string
+	}
+	read := func(r *Reader, raw bool) (parts []part, err error) {
+		for {
+			var p *Part
+			if raw {
+				p, err = r.NextRawPart()
+			} else {
+				p, err = r.NextPart()
+			}
+			if err == io.EOF {
+				return parts, nil
+			}
+			if err != nil {
+				return parts, err
+			}
+			header := textproto.MIMEHeader{}
+			for k, vv := range p.Header {
+				header[k] = slices.Clone(vv)
+			}
+			b, err := io.ReadAll(p)
+			parts = append(parts, part{header, p.FormName(), string(b)})
+			if err != nil {
+				return parts, err
+			}
+		}
+	}
+
+	bodies := []string{
+		"--b\r\nContent-Disposition: form-data; name=\"a\"\r\nX-A: 1\r\nX-A: 2\r\n\r\nvalue\r\n--b\r\nContent-Disposition: form-data; name=\"f\"; filename=\"a.txt\"\r\nContent-Type: text/plain\r\n\r\ncontent\r\n--b--\r\n",
+		"--b\r\nContent-Type: text/plain\r\nContent-Transfer-Encoding: quoted-printable\r\n\r\nfoo=3Dbar\r\n--b\r\n\r\nno headers\r\n--b--\r\n",
+		"--b\r\nContent-Disposition: form-data; name=a\r\n\r\nx\r\n--b\r\n bad header\r\n\r\nx\r\n--b--\r\n",
+		"--b\r\nContent-Disposition: form-data; name=a\r\n\r\nunterminated",
+	}
+	reused := new(Reader)
+	reused.ReuseParts = true
+	for _, body := range bodies {
+		for _, raw := range []bool{false, true} {
+			want, wantErr := read(NewReader(strings.NewReader(body), "b"), raw)
+			reused.Reset(strings.NewReader(body), "b")
+			got, gotErr := read(reused, raw)
+			if !reflect.DeepEqual(got, want) || (gotErr == nil) != (wantErr == nil) {
+				t.Errorf("body %q, raw %v:\ngot  %v, %v\nwant %v, %v", body, raw, got, gotErr, want, wantErr)
+			}
+		}
+	}
+}
+
+func BenchmarkReuseParts(b *testing.B) {
+	var buf bytes.Buffer
+	w := NewWriter(&buf)
+	for i := range 100 {
+		if err := w.WriteField(fmt.Sprintf("field%d", i), "value"); err != nil {
+			b.Fatal(err)
+		}
+	}
+	if err := w.Close(); err != nil {
+		b.Fatal(err)
+	}
+	body := buf.Bytes()
+	boundary := w.Boundary()
+
+	for _, formName := range []bool{false, true} {
+		b.Run(fmt.Sprintf("FormName=%v", formName), func(b *testing.B) {
+			b.Run("NewReader", func(b *testing.B) {
+				b.ReportAllocs()
+				b.SetBytes(int64(len(body)))
+				for b.Loop() {
+					readParts(b, NewReader(bytes.NewReader(body), boundary), formName)
+				}
+			})
+			b.Run("Reset+ReuseParts", func(b *testing.B) {
+				b.ReportAllocs()
+				b.SetBytes(int64(len(body)))
+				var src bytes.Reader
+				r := new(Reader)
+				r.ReuseParts = true
+				for b.Loop() {
+					src.Reset(body)
+					r.Reset(&src, boundary)
+					readParts(b, r, formName)
+				}
+			})
+		})
+	}
+}
+
+func readParts(b *testing.B, r *Reader, formName bool) {
+	var buf [64]byte
+	for {
+		p, err := r.NextRawPart()
+		if err == io.EOF {
+			return
+		}
+		if err != nil {
+			b.Fatal(err)
+		}
+		if formName && p.FormName() == "" {
+			b.Fatal("missing name")
+		}
+		for {
+			if _, err := p.Read(buf[:]); err == io.EOF {
+				break
+			} else if err != nil {
+				b.Fatal(err)
+			}
+		}
 	}
 }
