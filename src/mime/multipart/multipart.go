@@ -117,13 +117,33 @@ func (p *Part) parseContentDisposition() {
 // the message's "Content-Type" header. Use [mime.ParseMediaType] to
 // parse such headers.
 func NewReader(r io.Reader, boundary string) *Reader {
-	b := []byte("\r\n--" + boundary + "--")
-	return &Reader{
-		bufReader:        bufio.NewReaderSize(&stickyErrorReader{r: r}, peekBufferSize),
-		nl:               b[:2],
-		nlDashBoundary:   b[:len(b)-2],
-		dashBoundaryDash: b[2:],
-		dashBoundary:     b[2 : len(b)-2],
+	mr := new(Reader)
+	mr.Reset(r, boundary)
+	return mr
+}
+
+// Reset discards the [Reader]'s state and makes it read the parts of src,
+// separated by boundary, like [NewReader]. It reuses the memory of the
+// [Reader]: the parts returned before must not be used anymore.
+func (r *Reader) Reset(src io.Reader, boundary string) {
+	r.src = stickyErrorReader{r: src}
+	if r.bufReader == nil {
+		r.bufReader = bufio.NewReaderSize(&r.src, peekBufferSize)
+		r.tp.R = r.bufReader
+	} else {
+		r.bufReader.Reset(&r.src)
+	}
+	b := append(append(append(r.boundary[:0], "\r\n--"...), boundary...), "--"...)
+	r.boundary = b
+	r.nl = b[:2]
+	r.nlDashBoundary = b[:len(b)-2]
+	r.dashBoundaryDash = b[2:]
+	r.dashBoundary = b[2 : len(b)-2]
+	r.currentPart = nil
+	r.partsRead = 0
+	r.cur = Part{}
+	if cap(r.header) > maxRetainedHeaderSize {
+		r.header = nil
 	}
 }
 
@@ -172,9 +192,13 @@ func (p *Part) populateHeaders(maxMIMEHeaderSize, maxMIMEHeaders int64) error {
 	if err == nil {
 		p.Header = header
 	}
+	return headerError(err)
+}
+
+func headerError(err error) error {
 	// TODO: Add a distinguishable error to net/textproto.
 	if err != nil && err.Error() == "message too large" {
-		err = ErrMessageTooLarge
+		return ErrMessageTooLarge
 	}
 	return err
 }
@@ -332,7 +356,15 @@ func (p *Part) Close() error {
 // isn't supported.
 type Reader struct {
 	bufReader *bufio.Reader
+	src       stickyErrorReader
+	boundary  []byte
 	tempDir   string // used in tests
+
+	// The current part of Next.
+	tp     textproto.Reader
+	cur    Part
+	header []byte // "key:value\n" lines
+	form   formParams
 
 	currentPart *Part
 	partsRead   int
@@ -382,11 +414,25 @@ func (r *Reader) NextRawPart() (*Part, error) {
 }
 
 func (r *Reader) nextPart(rawPart bool, maxMIMEHeaderSize, maxMIMEHeaders int64) (*Part, error) {
+	if err := r.nextDelimiter(); err != nil {
+		return nil, err
+	}
+	bp, err := newPart(r, rawPart, maxMIMEHeaderSize, maxMIMEHeaders)
+	if err != nil {
+		return nil, err
+	}
+	r.currentPart = bp
+	return bp, nil
+}
+
+// nextDelimiter discards the current part and reads up to the
+// headers of the next one. It returns io.EOF after the last part.
+func (r *Reader) nextDelimiter() error {
 	if r.currentPart != nil {
 		r.currentPart.Close()
 	}
 	if string(r.dashBoundary) == "--" {
-		return nil, fmt.Errorf("multipart: boundary is empty")
+		return fmt.Errorf("multipart: boundary is empty")
 	}
 	expectNewPart := false
 	for {
@@ -398,29 +444,24 @@ func (r *Reader) nextPart(rawPart bool, maxMIMEHeaderSize, maxMIMEHeaders int64)
 			// (since it's missing the '\n'), but this is a valid
 			// multipart EOF so we need to return io.EOF instead of
 			// a fmt-wrapped one.
-			return nil, io.EOF
+			return io.EOF
 		}
 		if err != nil {
-			return nil, fmt.Errorf("multipart: NextPart: %w", err)
+			return fmt.Errorf("multipart: NextPart: %w", err)
 		}
 
 		if r.isBoundaryDelimiterLine(line) {
 			r.partsRead++
-			bp, err := newPart(r, rawPart, maxMIMEHeaderSize, maxMIMEHeaders)
-			if err != nil {
-				return nil, err
-			}
-			r.currentPart = bp
-			return bp, nil
+			return nil
 		}
 
 		if r.isFinalBoundary(line) {
 			// Expected EOF
-			return nil, io.EOF
+			return io.EOF
 		}
 
 		if expectNewPart {
-			return nil, fmt.Errorf("multipart: expecting a new Part; got line %q", string(line))
+			return fmt.Errorf("multipart: expecting a new Part; got line %q", string(line))
 		}
 
 		if r.partsRead == 0 {
@@ -437,7 +478,7 @@ func (r *Reader) nextPart(rawPart bool, maxMIMEHeaderSize, maxMIMEHeaders int64)
 			continue
 		}
 
-		return nil, fmt.Errorf("multipart: unexpected line in Next(): %q", line)
+		return fmt.Errorf("multipart: unexpected line in Next(): %q", line)
 	}
 }
 

@@ -13,3 +13,8 @@ import (
 //
 //go:linkname readMIMEHeader net/textproto.readMIMEHeader
 func readMIMEHeader(r *textproto.Reader, maxMemory, maxHeaders int64) (textproto.MIMEHeader, error)
+
+// appendMIMEHeader is defined in package [net/textproto].
+//
+//go:linkname appendMIMEHeader net/textproto.appendMIMEHeader
+func appendMIMEHeader(r *textproto.Reader, dst []byte, maxMemory, maxHeaders int64) ([]byte, error)

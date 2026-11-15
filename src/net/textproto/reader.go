@@ -538,45 +538,83 @@ func readMIMEHeader(r *Reader, maxMemory, maxHeaders int64) (MIMEHeader, error) 
 	}
 
 	m := make(MIMEHeader, hint)
+	m, _, err := readMIMEHeaderInto(r, m, strs, nil, maxMemory, maxHeaders)
+	return m, err
+}
+
+// appendMIMEHeader reads a MIME header like readMIMEHeader, and appends its
+// fields to dst as "key:value\n" lines, without canonicalizing the keys.
+// maxMemory limits the bytes appended.
+// It is called by the mime/multipart package.
+//
+//go:linkname appendMIMEHeader
+func appendMIMEHeader(r *Reader, dst []byte, maxMemory, maxHeaders int64) ([]byte, error) {
+	_, dst, err := readMIMEHeaderInto(r, nil, nil, dst, maxMemory, maxHeaders)
+	return dst, err
+}
+
+// readMIMEHeaderInto reads a MIME header into m if it isn't nil, or else
+// appends it to dst.
+func readMIMEHeaderInto(r *Reader, m MIMEHeader, strs []string, dst []byte, maxMemory, maxHeaders int64) (MIMEHeader, []byte, error) {
+	limit := int64(len(dst)) + maxMemory
 
 	// The first line cannot start with a leading space.
 	if buf, err := r.R.Peek(1); err == nil && (buf[0] == ' ' || buf[0] == '\t') {
 		const errorLimit = 80 // arbitrary limit on how much of the line we'll quote
 		line, err := r.readLineSlice(errorLimit)
 		if err != nil {
-			return m, err
+			return m, dst, err
 		}
-		return m, ProtocolError(fmt.Sprintf("malformed MIME header initial line: %q", line))
+		return m, dst, ProtocolError(fmt.Sprintf("malformed MIME header initial line: %q", line))
 	}
 
 	for {
 		kv, err := r.readContinuedLineSlice(maxMemory, mustHaveFieldNameColon)
 		if len(kv) == 0 {
-			return m, err
+			return m, dst, err
 		}
 
 		// Key ends at first colon.
 		k, v, ok := bytes.Cut(kv, colon)
 		if !ok {
-			return m, ProtocolError(fmt.Sprintf("malformed MIME header line: %q", kv))
+			return m, dst, ProtocolError(fmt.Sprintf("malformed MIME header line: %q", kv))
 		}
-		key, ok := canonicalMIMEHeaderKey(k)
+		var key string
+		if m != nil {
+			key, ok = canonicalMIMEHeaderKey(k)
+		} else {
+			ok = validMIMEHeaderKey(k)
+		}
 		if !ok {
-			return m, ProtocolError(fmt.Sprintf("malformed MIME header line: %q", kv))
+			return m, dst, ProtocolError(fmt.Sprintf("malformed MIME header line: %q", kv))
 		}
 		for _, c := range v {
 			if !validHeaderValueByte(c) {
-				return m, ProtocolError(fmt.Sprintf("malformed MIME header line: %q", kv))
+				if m == nil {
+					// Quote the line with its key canonicalized, like for m.
+					canonicalMIMEHeaderKey(k)
+				}
+				return m, dst, ProtocolError(fmt.Sprintf("malformed MIME header line: %q", kv))
 			}
 		}
 
 		maxHeaders--
 		if maxHeaders < 0 {
-			return nil, errMessageTooLarge
+			return nil, dst, errMessageTooLarge
 		}
 
 		// Skip initial spaces in value.
-		value := string(bytes.TrimLeft(v, " \t"))
+		v = bytes.TrimLeft(v, " \t")
+
+		if m == nil {
+			dst = append(append(append(append(dst, k...), ':'), v...), '\n')
+			if maxMemory = limit - int64(len(dst)); maxMemory < 0 {
+				return nil, dst, errMessageTooLarge
+			}
+			continue
+		}
+
+		value := string(v)
 
 		vv := m[key]
 		if vv == nil {
@@ -589,7 +627,7 @@ func readMIMEHeader(r *Reader, maxMemory, maxHeaders int64) (MIMEHeader, error) 
 		}
 		maxMemory -= int64(len(value))
 		if maxMemory < 0 {
-			return m, errMessageTooLarge
+			return m, dst, errMessageTooLarge
 		}
 		if vv == nil && len(strs) > 0 {
 			// More than likely this will be a single-element key.
@@ -604,9 +642,23 @@ func readMIMEHeader(r *Reader, maxMemory, maxHeaders int64) (MIMEHeader, error) 
 		}
 
 		if err != nil {
-			return m, err
+			return m, dst, err
 		}
 	}
+}
+
+// validMIMEHeaderKey reports whether key contains only valid characters
+// and spaces, like canonicalMIMEHeaderKey.
+func validMIMEHeaderKey(key []byte) bool {
+	if len(key) == 0 {
+		return false
+	}
+	for _, c := range key {
+		if !validHeaderFieldByte(c) && c != ' ' {
+			return false
+		}
+	}
+	return true
 }
 
 // noValidation is a no-op validation func for readContinuedLineSlice

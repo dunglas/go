@@ -1,0 +1,5 @@
+go test fuzz v1
+[]byte("--b\na:\x1b")
+string("b")
+uint64(21)
+byte('\x01')
