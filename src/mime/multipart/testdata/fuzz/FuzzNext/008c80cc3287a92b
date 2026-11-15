@@ -1,0 +1,5 @@
+go test fuzz v1
+[]byte("--b\nContent-TrAnsfer-EnCoding:quoted-printABle\n\n\x12\n000\n")
+string("b")
+uint64(55)
+byte('\x02')
