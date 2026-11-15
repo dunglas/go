@@ -322,6 +322,31 @@ func TestReadMIMEHeaderTrimContinued(t *testing.T) {
 	}
 }
 
+func TestReadMIMEHeaderValueSpaces(t *testing.T) {
+	for _, tt := range []struct {
+		in   string
+		want string
+	}{
+		{"K: v\r\n\r\n", "v"},
+		{"K:v\r\n\r\n", "v"},
+		{"K:\t \tv\r\n\r\n", "v"},
+		{"K: \t\r\n\r\n", ""},
+		{"K:\r\n\r\n", ""},
+		{"K:\r\n \tv\r\n\r\n", "v"},
+		{"K: v \t w\r\n\r\n", "v \t w"},
+		{"K: v\r\n \r\n\r\n", "v "},
+	} {
+		m, err := reader(tt.in).ReadMIMEHeader()
+		if err != nil {
+			t.Errorf("ReadMIMEHeader(%q): %v", tt.in, err)
+			continue
+		}
+		if got := m["K"]; len(got) != 1 || got[0] != tt.want {
+			t.Errorf("ReadMIMEHeader(%q)[\"K\"] = %q, want [%q]", tt.in, got, tt.want)
+		}
+	}
+}
+
 // Test that reading a header doesn't overallocate. Issue 58975.
 func TestReadMIMEHeaderAllocations(t *testing.T) {
 	var totalAlloc uint64

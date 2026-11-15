@@ -576,7 +576,10 @@ func readMIMEHeader(r *Reader, maxMemory, maxHeaders int64) (MIMEHeader, error) 
 		}
 
 		// Skip initial spaces in value.
-		value := string(bytes.TrimLeft(v, " \t"))
+		for len(v) > 0 && (v[0] == ' ' || v[0] == '\t') {
+			v = v[1:]
+		}
+		value := string(v)
 
 		vv := m[key]
 		if vv == nil {
